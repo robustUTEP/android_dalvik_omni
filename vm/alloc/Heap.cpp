@@ -37,6 +37,10 @@
 
 #include <cutils/trace.h>
 
+// Snappy additions
+#include "alloc/Logging.h"
+#include "alloc/DlMalloc.h"
+
 static const GcSpec kGcForMallocSpec = {
     true,  /* isPartial */
     false,  /* isConcurrent */
@@ -72,6 +76,17 @@ static const GcSpec kGcBeforeOomSpec = {
 };
 
 const GcSpec *GC_BEFORE_OOM = &kGcBeforeOomSpec;
+
+//# Begin Snappy mod
+static const GcSpec kGcExplicitFullSpec = {
+    false,  /* isPartial */
+    true,  /* isConcurrent */
+    true,  /* doPreserve */
+    "GC_EXPLICIT_FULL"
+};
+
+const GcSpec *GC_EXPLICIT_FULL = &kGcExplicitFullSpec;
+//# Begin Snappy end
 
 /*
  * Initialize the GC heap.
@@ -184,6 +199,35 @@ static void gcForMalloc(bool clearSoftReferences)
 static void *tryMalloc(size_t size)
 {
     void *ptr;
+    
+    //# Snappy mod start
+    logPrint(LOG_TRY_MALLOC, false, size, 0);
+    totalAlloced += size;
+    int i;
+    int state = DID_NOTHING;
+
+    // log history
+    if (policyNumber >= 4) {
+        saveHistory();
+        // log hare size
+        if (size > hares[0]) {
+            if (size > hares[1]) {
+                hares[0] = hares[1];
+                if (size > hares[2]) {
+                	hares[0] = hares[1];
+                    hares[1] = hares[2];
+                    hares[2] = size;
+                } else {
+                	hares[0] = hares[1];
+                    hares[1] = size;
+                }
+            } else {
+                hares[0] = size;
+            }
+        }
+                      
+    }
+    //# Snappy mod end
 
 //TODO: figure out better heuristics
 //    There will be a lot of churn if someone allocates a bunch of
@@ -197,8 +241,203 @@ static void *tryMalloc(size_t size)
 
     ptr = dvmHeapSourceAlloc(size);
     if (ptr != NULL) {
+        //# Snappy mod start
+        logPrint(LOG_TRY_MALLOC, false, size, 0);
+        savePtr(ptr, size);
+        //# Snappy mod end
         return ptr;
     }
+    
+    //# Snappy mod start
+    lastExhaustion = dvmGetRTCTimeMsec();
+    // malloc failed so log it if we didn't already
+    logPrint(LOG_TRY_MALLOC, true, size, 0);
+    
+     // if we're running MI policy then
+     // check if heap should grow instead
+     // of running gcs
+     if (!(policyType & (BASELINE + THROTTLE_THRESHOLD + MAX_GROW_STW + MAX_GROW_BG)) || MIS) {
+         
+		#ifdef snappyDebugging
+		ALOGD("Robust Policy Check Malloc Fail, polcy < 12 != 1");
+		#endif
+		// if we're running adaptive set the threshold
+		if (adaptive) {
+			setThreshold();
+		}
+		ptr = dvmHeapSourceAllocAndGrow(size);
+
+		// MI policies actively schedule so they should finish here if allocation is successful
+		if ((adaptive) && (ptr != NULL)) {
+			logPrint(LOG_TRY_MALLOC, true, size, 0);
+			//ALOGD("Robust Policy Check Malloc Fail Grow");
+			savePtr(ptr, size);
+			return ptr;
+		}
+
+		// if it's been less than the min GC time
+		// return, otherwise continue and run a GC
+		u8 elapsedSinceGC = dvmGetRTCTimeMsec() - lastGCTime;
+		u8 elapsedCPUSinceGC = dvmGetTotalProcessCpuTimeMsec() - lastGCCPUTime;
+		if (!(policyType & MIN_CPU_INTERVAL) && (elapsedSinceGC < minGCTime) && (ptr != NULL)) {
+			logPrint(LOG_TRY_MALLOC, true, size, 0);
+			//ALOGD("Robust Policy Check Malloc Fail Below Threshold Time");
+			savePtr(ptr, size);
+			return ptr;
+		} else if ((elapsedCPUSinceGC < (minGCTime / 2)) && (elapsedSinceGC < minGCTime) && (ptr != NULL)) {
+			logPrint(LOG_TRY_MALLOC, true, size, 0);
+			//ALOGD("Robust Policy Check Malloc Fail Below Threshold Time");
+			savePtr(ptr, size);
+			return ptr;
+		}			
+
+         
+        //ALOGD("Robust Policy Check Malloc Fail GC");        
+     } else if (policyType & THROTTLE_THRESHOLD) {
+
+		#ifdef snappyDebugging
+		ALOGD("Robust Policy Check Malloc Fail, policy >= 12");
+		#endif
+
+		/* 
+		 * New Rate Throttling Policies algo
+		 */
+		if (firstExhaustSinceGC) {
+			firstExhaustSinceGC = false;			
+			adjustThreshold();
+		}
+		
+		// if where running a spleeny algorithm release the spleen
+		// on exhaustion if we have one and see if it freed enough
+		// space
+		#ifdef snappyDebugging
+		ALOGD("Robust log spleen value malloc fail %p", spleen);
+		#endif
+		if ((spleenPolicy) && (spleen != NULL)) {
+		    #ifdef snappyDebugging
+		    ALOGD("robust Log Releasing spleen on exhaustion");
+		    #endif
+		    dvmFreeSpleen(spleen);
+		    spleen = NULL;
+		    schedGC = true;
+		    spleenGC = false;
+		    // try to alloc again
+	        ptr = dvmHeapSourceAlloc(size);
+            if (ptr != NULL) {
+                logPrint(LOG_TRY_MALLOC, false, size, RELEASE_SPLEEN);
+                savePtr(ptr, size);
+                return ptr;
+            }
+            
+            // if that didn't work grow and go
+            ptr = dvmHeapSourceAllocAndGrow(size);
+            if (ptr != NULL) {
+                logPrint(LOG_TRY_MALLOC, false, size, GROW_AND_GO);
+                savePtr(ptr, size);
+                return ptr;
+            }
+        }
+
+		/*
+		 * if GC not running kick off GC, grow heap
+		 * and move on
+		 */ 
+		if (!gDvm.gcHeap->gcRunning) {
+		    if (!schedGC) {
+			    schedGC = true;	// allows us to schedule gc if < 2s since last
+			    scheduleConcurrentGC();
+			    state = SCHED_GC;
+			}
+			// grow heap and move on
+			ptr = dvmHeapSourceAllocAndGrow(size);
+			if (ptr != NULL) {
+			    logPrint(LOG_TRY_MALLOC, true, size, state);
+				savePtr(ptr, size);
+				return ptr;
+			}
+		} else {
+			/* 
+			 * GC is running
+			 * Check if we can complete within 20ms if so wait,
+			 * otherwise grow heap and move on
+			 */
+
+			if ((dvmGetRTCTimeMsec() - gcStartTime) > (getGCTimeAverage() - 15)) {
+				// keep trying to mall every 15ms, after 15 grow heap and move one
+				i = 0;				
+				while (i < timeToWait) {	
+					ptr = dvmHeapSourceAlloc(size);
+					if (ptr != NULL) {
+					    logPrint(LOG_TRY_MALLOC, true, size, SUCCESS);
+						savePtr(ptr, size);
+						return ptr;
+					}
+					if (!gDvm.gcHeap->gcRunning) {
+						ptr = dvmHeapSourceAllocAndGrow(size);
+						if (ptr != NULL) {
+						    logPrint(LOG_TRY_MALLOC, true, size, SUCCESS);
+							savePtr(ptr, size);
+							return ptr;
+						}
+					}
+					i += 1;
+					nanosleep(&minSleepTime, NULL);
+
+				}	
+				// we should only reach this point if 
+				// time is over 20ms or we couldn't alloc
+				// enough space so grow and move on
+				ptr = dvmHeapSourceAllocAndGrow(size);
+				if (ptr != NULL) {
+				    logPrint(LOG_TRY_MALLOC, true, size, TIMEOUT);
+					savePtr(ptr, size);
+					return ptr;
+				}
+			} else {
+				ptr = dvmHeapSourceAllocAndGrow(size);
+				if (ptr != NULL) {
+				    logPrint(LOG_TRY_MALLOC, true, size, PRED_LONG);
+					savePtr(ptr, size);
+					return ptr;
+				}
+			}
+		}		
+
+	} else if ((policyType & MAX_GROW_STW) || (policyType & MAX_GROW_BG)) {
+	    // max grow policies
+	    size_t allocated[2];
+	    dvmHeapSourceGetValue(HS_BYTES_ALLOCATED,allocated,2);
+	    // if we've grown past our max limit run STW or BG GC as needed
+	    //ALOGD("Robust Log Max Policy alloc %u maxGrow %u",allocated[0],maxGrowSize);
+	    if (allocated[0] > maxGrowSize) {
+	        if (policyType & MAX_GROW_STW) {
+	            gcForMalloc(false);
+	            ptr = dvmHeapSourceAlloc(size);
+	        } else {
+	            // for the max grow BG policy
+	            // if BG GC isn't running then start it
+	            if (!gDvm.gcHeap->gcRunning)
+	                dvmInitConcGC();
+	            // grown the heap and move on
+	            ptr = dvmHeapSourceAlloc(size);
+	        }
+	        
+	    } else {
+	        // otherwise grow heap
+	        ptr = dvmHeapSourceAllocAndGrow(size);
+	        // to avoid thrashing grow heap
+	        dvmHeapSourceGrowForUtilization();
+	    }
+	    
+		if (ptr != NULL) {
+		    logPrint(LOG_TRY_MALLOC, true, size, GROW_AND_GO);
+			savePtr(ptr, size);
+			return ptr;
+		}
+		ALOGD("Robust Log Max Grow Failure");
+	            
+	}
+	//# Snappy mod end
 
     /*
      * The allocation failed.  If the GC is running, block until it
@@ -209,7 +448,13 @@ static void *tryMalloc(size_t size)
          * The GC is concurrently tracing the heap.  Release the heap
          * lock, wait for the GC to complete, and retrying allocating.
          */
+        //# Snappy mod start
+        logPrint(LOG_WAIT_CONC_GC);
+        //# Snappy mod end
         dvmWaitForConcurrentGcToComplete();
+        //# Snappy mod start
+        logPrint(LOG_WAIT_CONC_GC);
+        //# Snappy mod end
     } else {
       /*
        * Try a foreground GC since a concurrent GC is not currently running.
@@ -219,6 +464,10 @@ static void *tryMalloc(size_t size)
 
     ptr = dvmHeapSourceAlloc(size);
     if (ptr != NULL) {
+        //# Snappy mod start
+        logPrint(LOG_TRY_MALLOC, false, size, 0);
+        savePtr(ptr, size);
+        //# Snappy mod end
         return ptr;
     }
 
@@ -236,6 +485,10 @@ static void *tryMalloc(size_t size)
         LOGI_HEAP("Grow heap (frag case) to "
                 "%zu.%03zuMB for %zu-byte allocation",
                 FRACTIONAL_MB(newHeapSize), size);
+        //# Snappy mod start
+        logPrint(LOG_TRY_MALLOC, false, size, 0);
+        savePtr(ptr, size);
+        //# Snappy mod end
         return ptr;
     }
 
@@ -251,6 +504,10 @@ static void *tryMalloc(size_t size)
     gcForMalloc(true);
     ptr = dvmHeapSourceAllocAndGrow(size);
     if (ptr != NULL) {
+        //# Snappy mod start
+        logPrint(LOG_TRY_MALLOC, false, size, 0);
+        savePtr(ptr, size);
+        //# Snappy mod end
         return ptr;
     }
 //TODO: maybe wait for finalizers and try one last time
@@ -259,6 +516,10 @@ static void *tryMalloc(size_t size)
 //TODO: tell the HeapSource to dump its state
     dvmDumpThread(dvmThreadSelf(), false);
 
+    //# Snappy mod start
+    logPrint(LOG_TRY_MALLOC, false, size, 0);
+    savePtr(ptr, size);
+    //# Snappy mod end
     return NULL;
 }
 
@@ -453,6 +714,55 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
     size_t currAllocated, currFootprint;
     size_t percentFree;
     int oldThreadPriority = INT_MAX;
+    
+    //# Snappy mod start    
+    size_t currAllocatedS[2], currFootprintS[2];
+	
+    // check if we're doing MI2A* or MI2E
+    // on MI2A* we ignore explicits on MI2AE
+    // MI2A will allow them to go through
+    // MI2S also ignores
+    // MI2AE uses it to schedule GC
+    if ((policyType & IGNORE_EXPLICIT) && (spec == GC_EXPLICIT)) {
+        if (policyType & EXPLICIT_HINT) {
+            schedGC = true;
+        }
+        logPrint(LOG_IGNORE_EXPLICIT);
+        return;
+    }
+    #ifdef snappyDebugging
+    ALOGD("Robust log spleen value begin GC %p", spleen);
+    #endif
+    logPrint(LOG_GC, spec);
+    if (spleenPolicy && (spleen != NULL)) {
+        // free the spleen
+        char custMsg[256];
+        sprintf(custMsg,",\"size\":%zu"
+		    ,currSpleenSize);
+        logPrint(LOG_CUSTOM,"freeSpleen", (char*)custMsg);
+        #ifdef snappyDebugging
+        ALOGD("Robust Log Freeing Spleen size %d",currSpleenSize);
+        #endif
+        dvmFreeSpleen(spleen);
+        spleen = NULL;
+	    spleenGC = true;
+    }
+    
+    // experimental setup perf counters
+    // setup is done here because only 
+    // the calling thread will have perf counters
+    if (!countersReady() && !inZygote)
+        setupCounters();
+    // reset counters and enable
+    #ifdef snappyDebugging
+    ALOGD("Robust Log reseting perfcounters");
+    #endif
+    resetCounters();
+    #ifdef snappyDebugging
+    ALOGD("Robust Log enabling perfcounters");
+    #endif
+    enableCounters();
+    //# Snappy mod end
 
     /* The heap lock must be held.
      */
@@ -476,6 +786,12 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
     }
 
     gcHeap->gcRunning = true;
+    
+    //# Snappy mod start
+    /* *** dump heap *** */
+	saveHeap();
+	gcStartTime = dvmGetRTCTimeMsec();
+    //# Snappy mod end
 
     rootStart = dvmGetRelativeTimeMsec();
     ATRACE_BEGIN("GC: Threads Suspended"); // Suspend A
@@ -529,6 +845,10 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
         ATRACE_END(); // Suspend A
         rootEnd = dvmGetRelativeTimeMsec();
     }
+    
+    //# Snappy mod start
+    logPrint(LOG_GC, spec);
+    //# Snappy mod end
 
     /* Recursively mark any objects that marked objects point to strongly.
      * If we're not collecting soft references, soft-reachable
@@ -625,13 +945,26 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
      * This doesn't actually resize any memory;
      * it just lets the heap grow more when necessary.
      */
-    dvmHeapSourceGrowForUtilization();
+     
+    //# Snappy mod start
+    // only resize based on policy (or if we're something 
+    // important so we can rapidly grow, slow start fix)
+    if (resizeOnGC || inZygote)
+        dvmHeapSourceGrowForUtilization();
+    dvmHeapSourceGetValue(HS_BYTES_ALLOCATED, currAllocatedS, 2);
+    dvmHeapSourceGetValue(HS_FOOTPRINT, currFootprintS, 2);
+    //# Snappy mod end
 
     currAllocated = dvmHeapSourceGetValue(HS_BYTES_ALLOCATED, NULL, 0);
     currFootprint = dvmHeapSourceGetValue(HS_FOOTPRINT, NULL, 0);
 
     dvmMethodTraceGCEnd();
     LOGV_HEAP("GC finished");
+    
+    //# Snappy mod start
+    /* *** dump heap *** */
+	saveHeap();
+    //# Snappy mod end
 
     gcHeap->gcRunning = false;
 
@@ -703,6 +1036,92 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
     }
 
     ATRACE_END(); // Top-level GC
+    
+    //# Snappy mod start
+    // experimental disable event counters
+    // we reset them to leave them in a clean 
+    // state in case someone else needs them
+    #ifdef snappyDebugging
+    ALOGD("Robust Log disabling pefcounters");
+    #endif
+    disableCounters();
+
+    // update last GC Time
+    lastGCTime = dvmGetRTCTimeMsec();
+	lastGCCPUTime = dvmGetTotalProcessCpuTimeMsec();
+	firstExhaustSinceGC = true;
+
+	// update gc times
+	storeGCTime(lastGCTime - gcStartTime);
+
+	// update the threshold if necessary
+	if (resizeThreshold && thresholdOnGC) {
+		int thresholdTmp = threshold + (thresholdOnGC - (currFootprintS[0] - currAllocatedS[0]));
+		if (thresholdTmp >  1024) {
+			threshold = thresholdTmp;
+		} else {
+			threshold = 1024;
+		}
+	}
+
+	thresholdOnGC = (currFootprintS[0] - currAllocatedS[0]);
+	adjustThreshold();
+	
+	// adjust the spleen if we're running the policy
+	#ifdef snappyDebugging
+	ALOGD("Robust log spleen value end GC %p", spleen);
+	#endif
+	if (spleenPolicy) {
+	    // if no spleen alloc a spleen growing if necessary
+	    if ((spleen == NULL) && (spleenSize > 1024)) {
+	        currSpleenSize = spleenSize;
+	        char custMsg[256];
+	        sprintf(custMsg,",\"size\":%zu"
+			,spleenSize);
+	        logPrint(LOG_CUSTOM,"allocSpleen", (char*)custMsg);
+	        #ifdef snappyDebugging
+	        ALOGD("Robust Log Alloc Spleen size %d",currSpleenSize);
+	        #endif
+	        spleen = dvmHeapSourceAllocAndGrow(spleenSize);
+            if (spleen) {
+	            spleenGC = false;
+	            savePtr(spleen, spleenSize);
+	            oldSpleenSize = spleenSize;
+	        }
+	    }
+    }
+
+    /* Write GC info to log if the log's ready*/
+    logPrint(LOG_GC, spec, numBytesFreed, numObjectsFreed);
+
+	// if we're concurrent increase the number of iterations
+	if ((policyType & THROTTLE_THRESHOLD) && (spec == GC_CONCURRENT)) {
+		currIterations++;
+	}
+
+	// recompute average GC yeilds
+	if (spec == GC_CONCURRENT) {
+		if (avgPercFreedPartial > 0) {
+			avgPercFreedPartial = (partialAlpha * (float)numBytesFreed) + ((1 - partialAlpha) * (float)avgPercFreedPartial);
+		} else {
+			avgPercFreedPartial = numBytesFreed;
+		}
+	}	
+	if (spec == GC_EXPLICIT_FULL) {
+		if (avgPercFreedFull > 0) {
+			avgPercFreedFull = (fullAlpha * (float)numBytesFreed) + ((1 - fullAlpha) * (float)avgPercFreedFull);
+		} else {
+			avgPercFreedFull = numBytesFreed;
+		}
+	}
+	// if we've run a minimum number 
+	// of iterations of partial GCs run a 
+	// full GC
+	if ((policyType & THROTTLE_THRESHOLD) && (spec == GC_CONCURRENT) && (currIterations > numIterations)) {
+		currIterations = 0;
+		dvmCollectGarbageInternal(GC_EXPLICIT_FULL);
+	}
+    //# Snappy mod end
 }
 
 /*

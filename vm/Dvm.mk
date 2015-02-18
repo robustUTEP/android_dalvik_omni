@@ -115,6 +115,8 @@ LOCAL_SRC_FILES := \
 	Sync.cpp \
 	Thread.cpp \
 	UtfString.cpp \
+    alloc/PerfCounts.cpp \
+	alloc/Logging.cpp \
 	alloc/Alloc.cpp \
 	alloc/CardTable.cpp \
 	alloc/HeapBitmap.cpp.arm \

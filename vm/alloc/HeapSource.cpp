@@ -29,6 +29,8 @@
 #include "alloc/HeapBitmap.h"
 #include "alloc/HeapBitmapInlines.h"
 
+#include "alloc/Logging.h"
+
 static void dvmHeapSourceUpdateMaxNativeFootprint();
 static void snapIdealFootprint();
 static void setIdealFootprint(size_t max);
@@ -816,6 +818,17 @@ size_t dvmHeapSourceGetValue(HeapSourceValueSpec spec, size_t perHeapStats[],
         case HS_OBJECTS_ALLOCATED:
             value = heap->objectsAllocated;
             break;
+        // snappy mod start        
+        case HS_VM_SIZE:
+            value = heap->limit - heap->base;
+            break;
+        case HS_BASE:
+            value = (size_t) (heap->base - 0);
+            break;
+        case HS_LIMIT:
+            value = (size_t) (heap->limit - 0);
+            break;
+        // snappy mod end
         default:
             // quiet gcc
             break;
@@ -980,7 +993,7 @@ void* dvmHeapSourceAlloc(size_t n)
          */
         return ptr;
     }
-    if (heap->bytesAllocated > heap->concurrentStartBytes) {
+    if ((policyType & BASELINE) && (heap->bytesAllocated > heap->concurrentStartBytes)) {
         /*
          * We have exceeded the allocation threshold.  Wake up the
          * garbage collector.
@@ -1601,4 +1614,55 @@ void dvmHeapSourceRegisterNativeFree(int bytes)
         }
     } while (android_atomic_cas(expected_size, new_size,
                                 &gHs->nativeBytesAllocated));
+}
+
+/*
+ * Kickoff GC from external source
+ */
+void dvmInitConcGC(void)
+{
+    if (gDvm.gcHeap->gcRunning) {
+        /*
+         * The GC is concurrently tracing the heap.  Release the heap
+         * lock, wait for the GC to complete, and return.
+         */
+        dvmWaitForConcurrentGcToComplete();
+        return;
+    }
+    dvmSignalCond(&gHs->gcThreadCond);
+    return;
+}
+
+/*
+ * Used to free a spleen
+ */
+void dvmFreeSpleen(void* spleen)
+{
+    #ifdef snappyDebugging
+    ALOGD("Robust Log Freeing Spleen %zu, value %p", currSpleenSize, spleen);
+    #endif
+    size_t freed = 0;
+    if (spleen) {
+        void *list[1];
+        list[0] = spleen;
+        freed = dvmHeapSourceFreeList(1, list);
+    	freed = freed; // keep compiler quite
+    }
+    spleen = NULL;
+    #ifdef snappyDebugging
+    ALOGD("Robust Log Freed Spleen %zu, value %p", freed, spleen);
+    #endif
+}
+
+/*
+ * used to grow heap to a specific size
+ */
+void dvmSetSize(size_t size)
+{
+	HeapSource *hs = gHs;
+	mspace msp = hs->heaps[0].msp;
+	
+	setIdealFootprint(size + getSoftFootprint(false));
+    mspace_set_footprint_limit(msp, size);
+    hs->softLimit = size + getSoftFootprint(false);
 }

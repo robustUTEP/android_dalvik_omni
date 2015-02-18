@@ -32,6 +32,11 @@ enum HeapSourceValueSpec {
     HS_ALLOWED_FOOTPRINT,
     HS_BYTES_ALLOCATED,
     HS_OBJECTS_ALLOCATED
+    // snappy mod start
+    ,HS_VM_SIZE,
+  	HS_LIMIT,
+  	HS_BASE
+    // snappy mod end
 };
 
 /*
@@ -208,6 +213,22 @@ void dvmHeapSourceRegisterNativeAllocation(int bytes);
 /*
  * Called from VMRuntime.registerNativeFree.
  */
-void dvmHeapSourceRegisterNativeFree(int bytes);
+void dvmHeapSourceRegisterNativeFree(int bytes);\
+
+/*
+ * Initiates concurrent Garbage collection
+ * Used for kicking off GC outside of heapsource
+ */
+void dvmInitConcGC(void);
+
+/*
+ * Used to free a spleen
+ */
+void dvmFreeSpleen(void* spleen);
+
+/*
+ * used to grow heap
+ */
+void dvmSetSize(size_t size);
 
 #endif  // DALVIK_HEAP_SOURCE_H_
